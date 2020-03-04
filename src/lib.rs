@@ -4,6 +4,7 @@ use {
     dunce::realpath,
     log::{error, info, warn},
     std::{
+        collections::HashMap,
         fs::File,
         io::{copy, Error, ErrorKind, Read, Result, Write},
         net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
@@ -12,27 +13,29 @@ use {
 };
 
 pub enum Never {}
-pub fn serve(
+pub fn serve<S: ::std::hash::BuildHasher>(
     endpoint: impl ToSocketAddrs,
     directory: &Path,
     index: &[&Path],
     e404: &[&Path],
+    content_types: &HashMap<String, String, S>,
 ) -> Result<Never> {
     let directory = realpath(directory)?;
     info!("Serving {:?}...", &directory);
     for incoming in TcpListener::bind(endpoint)?.incoming() {
-        if let Err(error) = handle_incoming(incoming, &directory, index, e404) {
+        if let Err(error) = handle_incoming(incoming, &directory, index, e404, content_types) {
             error!("{}", error)
         }
     }
     unreachable!()
 }
 
-pub fn handle_incoming(
+pub fn handle_incoming<S: ::std::hash::BuildHasher>(
     incoming: Result<TcpStream>,
     directory: &Path,
     index: &[&Path],
     e404: &[&Path],
+    content_types: &HashMap<String, String, S>,
 ) -> Result<()> {
     let mut stream = incoming?;
 
@@ -99,13 +102,14 @@ pub fn handle_incoming(
                     } else {
                         index.into()
                     };
-                    if try_serve(&mut stream, b"200 OK", &directory, &index).is_ok() {
+                    if try_serve(&mut stream, b"200 OK", &directory, &index, content_types).is_ok()
+                    {
                         info!("{:?} -> index {:?}", path, index);
                         stream.shutdown(Shutdown::Write)?;
                         return Ok(());
                     }
                 }
-            } else if try_serve(&mut stream, b"200 OK", &directory, &path).is_ok() {
+            } else if try_serve(&mut stream, b"200 OK", &directory, &path, content_types).is_ok() {
                 info!("{:?} -> file {:?}", path, path);
                 stream.shutdown(Shutdown::Write)?;
                 return Ok(());
@@ -117,7 +121,15 @@ pub fn handle_incoming(
                 } else {
                     e404.into()
                 };
-                if try_serve(&mut stream, b"404 Not Found", &directory, &e404).is_ok() {
+                if try_serve(
+                    &mut stream,
+                    b"404 Not Found",
+                    &directory,
+                    &e404,
+                    content_types,
+                )
+                .is_ok()
+                {
                     warn!("{:?} -> 404 {:?}", path, e404);
                     stream.shutdown(Shutdown::Write)?;
                     return Ok(());
@@ -134,7 +146,13 @@ pub fn handle_incoming(
     Ok(())
 }
 
-fn try_serve(stream: &mut impl Write, status: &[u8], directory: &Path, file: &Path) -> Result<()> {
+fn try_serve<S: ::std::hash::BuildHasher>(
+    stream: &mut impl Write,
+    status: &[u8],
+    directory: &Path,
+    file: &Path,
+    content_types: &HashMap<String, String, S>,
+) -> Result<()> {
     let file = realpath(directory.join(file))?;
     if !file.starts_with(directory) {
         return Err(Error::new(
@@ -142,9 +160,18 @@ fn try_serve(stream: &mut impl Write, status: &[u8], directory: &Path, file: &Pa
             "Can't serve: Outside directory",
         ));
     }
+    let content_type = file
+        .extension()
+        .map(|ext| ext.to_string_lossy())
+        .map(|ext| content_types.get(ext.as_ref()))
+        .flatten();
     let mut file = File::open(file)?;
     stream.write_all(b"HTTP/1.0 ")?;
     stream.write_all(status)?;
+    if let Some(content_type) = content_type {
+        stream.write_all(b"\r\nContent-Type: ")?;
+        stream.write_all(content_type.as_bytes())?;
+    }
     stream.write_all(b"\r\n\r\n")?;
     copy(&mut file, stream)?;
     stream.flush()?;
