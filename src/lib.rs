@@ -68,7 +68,7 @@ pub fn serve(
                 for part in path.iter() {
                     if part == ".." {
                         stream.write_all(
-                            b"HTTP/1.1 403 Forbidden\r\n\r\ndev-server doesn't support .. in URLs.",
+                            b"HTTP/1.0 403 Forbidden\r\n\r\ndev-server doesn't support .. in URLs.",
                         )?;
                         stream.flush()?;
                         warn!("{:?} -> .. forbidden", path);
@@ -108,7 +108,7 @@ pub fn serve(
                         continue 'request;
                     }
                 }
-                stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n")?;
+                stream.write_all(b"HTTP/1.0 404 Not Found\r\n\r\n")?;
                 stream.flush()?;
                 error!("{:?} -> 404", path);
                 stream.shutdown(Shutdown::Write)?;
@@ -129,7 +129,7 @@ fn try_serve(stream: &mut impl Write, status: &[u8], directory: &Path, file: &Pa
         ));
     }
     let mut file = File::open(file)?;
-    stream.write_all(b"HTTP/1.1 ")?;
+    stream.write_all(b"HTTP/1.0 ")?;
     stream.write_all(status)?;
     stream.write_all(b"\r\n\r\n")?;
     copy(&mut file, stream)?;
