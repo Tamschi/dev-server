@@ -11,6 +11,7 @@ dunce = "1.0.0"
 log = "0.4.8"
 simple_logger = "1.6.0"
 structopt = { version = "0.3.11", optional = true }
+lazy_static = "1.4.0"
 
 [lib]
 

@@ -1,44 +1,98 @@
 #![allow(clippy::cognitive_complexity)]
+//#![warn(missing_docs)]
+
+//! A small development server, just enough for a static page from a single directory.
+//! The defaults ensure secure limits regarding what is served to where.
 
 use {
     dunce::realpath,
+    lazy_static::lazy_static,
     log::{error, info, warn},
     std::{
-        collections::HashMap,
+        collections::{hash_map::RandomState, HashMap},
         fs::File,
+        hash::BuildHasher,
         io::{copy, Error, ErrorKind, Read, Result, Write},
-        net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
+        net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
         path::{Path, PathBuf},
     },
 };
 
+#[doc(hidden)]
 pub enum Never {}
-pub fn serve<S: ::std::hash::BuildHasher>(
-    endpoint: impl ToSocketAddrs,
-    directory: &Path,
-    index: &[&Path],
-    e404: &[&Path],
-    content_types: &HashMap<String, String, S>,
+
+pub struct Configuration<'a, E: ToSocketAddrs = SocketAddr, S: BuildHasher = RandomState> {
+    pub endpoint: E,
+    pub directory: &'a Path,
+    pub index: &'a [&'a Path],
+    pub e404: &'a [&'a Path],
+    pub content_types: &'a HashMap<&'a str, &'a str, S>,
+}
+
+lazy_static! {
+    static ref DEFAULT_DIRECTORY: &'static Path =
+        Box::leak(Box::new(PathBuf::from(".",))).as_path();
+    static ref DEFAULT_INDEX: &'static [&'static Path] = &*Box::leak(Box::new([Box::leak(
+        Box::new(PathBuf::from("./index.html",))
+    )
+    .as_path()]));
+    static ref DEFAULT_CONTENT_TYPES: HashMap<&'static str, &'static str> = {
+        let mut map = HashMap::new();
+        map.insert("html", "text/html");
+        map.insert("css", "text/css");
+        map.insert("js", "text/javascript");
+        map.insert("wasm", "application/wasm");
+        map
+    };
+}
+
+impl Default for Configuration<'_, SocketAddr, RandomState> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            endpoint: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8000),
+            directory: &DEFAULT_DIRECTORY,
+            index: &DEFAULT_INDEX,
+            e404: &[],
+            content_types: &DEFAULT_CONTENT_TYPES,
+        }
+    }
+}
+
+pub fn serve<E: ToSocketAddrs, S: ::std::hash::BuildHasher>(
+    configuration: &Configuration<E, S>,
 ) -> Result<Never> {
+    let Configuration {
+        endpoint,
+        directory,
+
+        index,
+        e404,
+        content_types,
+    } = configuration;
     let directory = realpath(directory)?;
     info!("Serving {:?}...", &directory);
     for incoming in TcpListener::bind(endpoint)?.incoming() {
-        if let Err(error) = handle_incoming(incoming, &directory, index, e404, content_types) {
-            error!("{}", error)
+        match incoming {
+            Ok(incoming) => {
+                if let Err(error) = handle_request(incoming, &directory, index, e404, content_types)
+                {
+                    error!("{}", error)
+                }
+            }
+            Err(error) => error!("{}", error),
         }
     }
     unreachable!()
 }
 
-pub fn handle_incoming<S: ::std::hash::BuildHasher>(
-    incoming: Result<TcpStream>,
+fn handle_request<S: ::std::hash::BuildHasher>(
+    mut stream: TcpStream,
     directory: &Path,
     index: &[&Path],
     e404: &[&Path],
-    content_types: &HashMap<String, String, S>,
+    content_types: &HashMap<&str, &str, S>,
 ) -> Result<()> {
-    let mut stream = incoming?;
-
     let request = {
         //BAD
         let mut buffer: Vec<u8> = Vec::new();
@@ -151,7 +205,7 @@ fn try_serve<S: ::std::hash::BuildHasher>(
     status: &[u8],
     directory: &Path,
     file: &Path,
-    content_types: &HashMap<String, String, S>,
+    content_types: &HashMap<&str, &str, S>,
 ) -> Result<()> {
     let file = realpath(directory.join(file))?;
     if !file.starts_with(directory) {

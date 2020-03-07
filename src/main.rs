@@ -1,7 +1,8 @@
 use {
-    dev_server::serve,
+    dev_server::{serve, Configuration},
     std::{
         collections::HashMap,
+        fmt::{Debug, Display, Formatter, Result as fmtResult},
         io::{Error, ErrorKind, Result},
         net::{IpAddr, SocketAddr},
         path::PathBuf,
@@ -25,14 +26,14 @@ A simple development HTTP server, focusing on simplicity and secure defaults.
 No files outside the served directory are served."
 )]
 struct Opt {
-    #[structopt(short, long, default_value = "8000")]
-    port: u16,
+    #[structopt(short, long, default_value)]
+    port: Port,
 
-    #[structopt(short, long, default_value = "127.0.0.1")]
-    remote: IpAddr,
+    #[structopt(short, long, default_value)]
+    remote: Remote,
 
-    #[structopt(short, long, parse(from_os_str), default_value = ".")]
-    directory: PathBuf,
+    #[structopt(short, long, default_value)]
+    directory: Directory,
 
     #[structopt(
         short,
@@ -48,21 +49,72 @@ struct Opt {
     #[structopt(long = "404", name = "path", parse(from_os_str), help = "¹")]
     e404: Vec<PathBuf>,
 
-    #[structopt(short, long, name = "extension=mime/type", default_value)]
-    content_types: Wrapper<Vec<(String, String)>>,
+    #[structopt(short, long, name = "extension=mime/type...", default_value)]
+    content_types: ContentTypes,
 }
 
-#[derive(Debug)]
-struct Wrapper<T>(T);
-impl<T> Wrapper<T> {
-    fn unwrap(self) -> T {
-        self.0
+macro_rules! opt_wrapper {
+    ($name:ident($inner:ident) = $default:expr) => {
+        #[derive(Debug)]
+        struct $name($inner);
+        impl Default for $name {
+            fn default() -> $name {
+                Self($default)
+            }
+        }
+    };
+    ($name:ident($inner:ident): Display = $default:expr) => {
+        opt_wrapper!($name($inner) = $default);
+        opt_wrapper!($name($inner): Display);
+    };
+    ($name:ident($inner:ident): FromStr = $default:expr) => {
+        opt_wrapper!($name($inner) = $default);
+        opt_wrapper!($name($inner): FromStr);
+    };
+    ($name:ident($inner:ident): Display + FromStr = $default:expr) => {
+        opt_wrapper!($name($inner) = $default);
+        opt_wrapper!($name($inner): Display);
+        opt_wrapper!($name($inner): FromStr);
+    };
+    ($name:ident($inner:ident): Display) => {
+        impl Display for $name {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmtResult {
+                <$inner as Display>::fmt(&self.0, fmt)
+            }
+        }
+    };
+    ($name:ident($inner:ident): FromStr) => {
+        impl FromStr for $name {
+            type Err = <$inner as FromStr>::Err;
+            fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+                $inner::from_str(s).map(Self)
+            }
+        }
+    };
+}
+
+opt_wrapper!(Port(u16): Display + FromStr = Configuration::default().endpoint.port());
+opt_wrapper!(Remote(IpAddr): Display + FromStr = Configuration::default().endpoint.ip());
+opt_wrapper!(Directory(PathBuf): FromStr = Configuration::default().directory.to_owned());
+
+impl Display for Directory {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        <PathBuf as Debug>::fmt(&self.0, fmt)
     }
 }
 
-impl FromStr for Wrapper<Vec<(String, String)>> {
+type ContentTypesMap = HashMap<String, String>;
+opt_wrapper!(
+    ContentTypes(ContentTypesMap) = Configuration::default()
+        .content_types
+        .iter()
+        .map(|c| ((*c.0).to_string(), (*c.1).to_string()))
+        .collect()
+);
+
+impl FromStr for ContentTypes {
     type Err = Error;
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let content_types = s.split_whitespace().filter(|s| !s.is_empty()).map(|s| {
             let mut split = s.split('=');
             let extension = split.next().unwrap();
@@ -77,28 +129,32 @@ impl FromStr for Wrapper<Vec<(String, String)>> {
             }
             Ok((extension.to_owned(), mime.to_owned()))
         });
-        Ok(Self(content_types.collect::<Result<Vec<_>>>()?))
-    }
-}
-impl ToString for Wrapper<Vec<(String, String)>> {
-    fn to_string(&self) -> String {
-        let pairs: Vec<_> = self
-            .0
-            .iter()
-            .map(|c| [c.0.as_ref(), c.1.as_ref()].join("="))
-            .collect();
-        pairs[..].join(" ")
+        Ok(Self(content_types.collect::<Result<HashMap<_, _>>>()?))
     }
 }
 
-impl Default for Wrapper<Vec<(String, String)>> {
-    fn default() -> Self {
-        Self(vec![
-            ("html".to_owned(), "text/html".to_owned()),
-            ("css".to_owned(), "text/css".to_owned()),
-            ("js".to_owned(), "text/javascript".to_owned()),
-            ("wasm".to_owned(), "application/wasm".to_owned()),
-        ])
+impl Display for ContentTypes {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> fmtResult {
+        let mut first = true;
+        let mut content_types: Vec<_> = self.0.iter().collect();
+        content_types.sort();
+        if let Some(max_extension_len) = content_types.iter().map(|c| c.0.len()).max() {
+            let fill = fmt.fill();
+            for (extension, content_type) in content_types {
+                if first {
+                    first = false;
+                    writeln!(fmt)?;
+                }
+
+                // This assumes lower ASCII characters.
+                for _ in 0..(max_extension_len - extension.len()) {
+                    write!(fmt, "{}", fill)?;
+                }
+                write!(fmt, "{}={}", extension, content_type)?;
+                writeln!(fmt)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -106,19 +162,21 @@ fn main() {
     simple_logger::init().unwrap();
 
     let opt = Opt::from_args();
-    serve(
-        SocketAddr::new(opt.remote, opt.port),
-        &opt.directory,
-        &if opt.no_index {
+    serve(&Configuration {
+        endpoint: SocketAddr::new(opt.remote.0, opt.port.0),
+        directory: &opt.directory.0,
+        index: &if opt.no_index {
             Vec::new()
         } else {
             opt.index.iter().map(PathBuf::as_path).collect::<Vec<_>>()
         },
-        &opt.e404.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
-        &opt.content_types
-            .unwrap()
-            .into_iter()
+        e404: &opt.e404.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        content_types: &opt
+            .content_types
+            .0
+            .iter()
+            .map(|c| (c.0.as_ref(), c.1.as_ref()))
             .collect::<HashMap<_, _>>(),
-    )
+    })
     .unwrap();
 }
